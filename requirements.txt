@@ -1,0 +1,5 @@
+flask
+pillow
+pymupdf
+werkzeug
+gunicorn
