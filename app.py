@@ -86,75 +86,118 @@ def compress_image(file_obj, target_mb, max_width, max_height, explicit_quality=
 
 def compress_pdf(file_obj, target_mb=None, explicit_quality=40):
     pdf_bytes = file_obj.read()
+    doc = fitz.open("pdf", pdf_bytes)
     
-    def try_compress(quality, scale=1.0):
-        doc = fitz.open("pdf", pdf_bytes)
-        # Attempt to compress images within the PDF if it's large
-        for page in doc:
-            for img in page.get_images(full=True):
-                xref = img[0]
-                try:
-                    base_image = doc.extract_image(xref)
-                    image_bytes = base_image["image"]
-                    
-                    pil_img = Image.open(io.BytesIO(image_bytes))
-                    if pil_img.mode in ('RGBA', 'P'):
-                        pil_img = pil_img.convert('RGB')
-                        
-                    if scale < 1.0:
-                        new_w = max(int(pil_img.width * scale), 10)
-                        new_h = max(int(pil_img.height * scale), 10)
-                        pil_img = pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    
-                    img_io = io.BytesIO()
-                    pil_img.save(img_io, format="JPEG", quality=quality, optimize=True)
-                    page.replace_image(xref, stream=img_io.getvalue())
-                except Exception:
-                    pass
-        
+    # Cache all unique images first to avoid extracting them multiple times
+    images_info = {}
+    for page_num in range(len(doc)):
+        page = doc[page_num]
+        for img in page.get_images(full=True):
+            xref = img[0]
+            if xref in images_info:
+                continue
+            try:
+                base_image = doc.extract_image(xref)
+                image_bytes = base_image["image"]
+                pil_img = Image.open(io.BytesIO(image_bytes))
+                if pil_img.mode in ('RGBA', 'P'):
+                    pil_img = pil_img.convert('RGB')
+                images_info[xref] = (page_num, pil_img)
+            except Exception:
+                pass
+    doc.close()
+
+    # If the PDF has no images, image compression won't reduce its size.
+    # Just deflate the structure once and return it.
+    if not images_info:
         output = io.BytesIO()
-        doc.save(output, garbage=4, deflate=True, clean=True)
-        doc.close()
+        temp_doc = fitz.open("pdf", pdf_bytes)
+        temp_doc.save(output, garbage=4, deflate=True, clean=True)
+        temp_doc.close()
         output.seek(0)
-        return output
+        return output, 'application/pdf', 'compressed.pdf'
 
     if target_mb:
         target_bytes = target_mb * 1024 * 1024
         scale = 1.0
         best_output = None
         
-        for step in range(10):
+        # Max 4 scale reductions to prevent timeouts on large files
+        for step in range(4):
+            # Pre-scale images for this specific scale step (resizing is CPU intensive)
+            scaled_images = {}
+            for xref, (page_num, pil_img) in images_info.items():
+                if scale < 1.0:
+                    new_w = max(int(pil_img.width * scale), 10)
+                    new_h = max(int(pil_img.height * scale), 10)
+                    scaled_images[xref] = (page_num, pil_img.resize((new_w, new_h), Image.Resampling.LANCZOS))
+                else:
+                    scaled_images[xref] = (page_num, pil_img)
+
+            def try_compress_cached(quality):
+                temp_doc = fitz.open("pdf", pdf_bytes)
+                for x_ref, (p_num, s_img) in scaled_images.items():
+                    try:
+                        img_io = io.BytesIO()
+                        s_img.save(img_io, format="JPEG", quality=quality, optimize=True)
+                        temp_doc[p_num].replace_image(x_ref, stream=img_io.getvalue())
+                    except Exception:
+                        pass
+                
+                output = io.BytesIO()
+                temp_doc.save(output, garbage=4, deflate=True, clean=True)
+                temp_doc.close()
+                output.seek(0)
+                return output
+
             low = 20
             high = 90
             found_in_this_scale = False
             
-            while low <= high:
+            # Max 5 binary search steps
+            for _ in range(5):
+                if low > high:
+                    break
                 mid = (low + high) // 2
-                temp_output = try_compress(quality=mid, scale=scale)
+                temp_output = try_compress_cached(quality=mid)
                 size = temp_output.getbuffer().nbytes
                 
                 if size <= target_bytes:
                     best_output = temp_output
                     found_in_this_scale = True
-                    # Try to get higher quality that still fits
-                    low = mid + 1
+                    low = mid + 1  # Try higher quality
                 else:
-                    high = mid - 1
+                    high = mid - 1 # Try lower quality
                     
             if found_in_this_scale:
                 break
                 
-            scale *= 0.8
+            scale *= 0.7  # More aggressive scale down to hit targets faster
             
         if best_output:
             return best_output, 'application/pdf', 'compressed.pdf'
             
-        # fallback to extreme compression
-        return try_compress(10, 0.5), 'application/pdf', 'compressed.pdf'
+        # Fallback if still over target
+        return try_compress_cached(10), 'application/pdf', 'compressed.pdf'
         
     else:
-        # Default PDF compression
-        return try_compress(explicit_quality, 1.0), 'application/pdf', 'compressed.pdf'
+        # Default single-pass compression
+        def compress_once():
+            temp_doc = fitz.open("pdf", pdf_bytes)
+            for xref, (p_num, pil_img) in images_info.items():
+                try:
+                    img_io = io.BytesIO()
+                    pil_img.save(img_io, format="JPEG", quality=explicit_quality, optimize=True)
+                    temp_doc[p_num].replace_image(xref, stream=img_io.getvalue())
+                except Exception:
+                    pass
+            output = io.BytesIO()
+            temp_doc.save(output, garbage=4, deflate=True, clean=True)
+            temp_doc.close()
+            output.seek(0)
+            return output
+            
+        return compress_once(), 'application/pdf', 'compressed.pdf'
 
 @app.route('/compress', methods=['POST'])
 def compress_file():
